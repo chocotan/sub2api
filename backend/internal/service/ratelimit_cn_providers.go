@@ -288,6 +288,20 @@ func (s *RateLimitService) applyCNProviderReactive429(
 		s.handleCNProviderInsufficientBalance(ctx, account, extractUpstreamErrorMessage(responseBody))
 		return true
 	}
+	// GLM 的普通 429 是 RPM/并发/繁忙限制，不能仅凭未来的窗口重置点判定套餐耗尽。
+	if account.Platform == PlatformZhipu {
+		resetAt := zhipu429ResetTime(account, headers, responseBody, time.Now())
+		if resetAt == nil {
+			return false
+		}
+		s.notifyAccountSchedulingBlocked(account, *resetAt, "429")
+		if err := s.accountRepo.SetRateLimited(ctx, account.ID, *resetAt); err != nil {
+			slog.Warn("rate_limit_set_failed", "account_id", account.ID, "error", err)
+			return true
+		}
+		slog.Info("zhipu_account_rate_limited", "account_id", account.ID, "reset_at", *resetAt)
+		return true
+	}
 	// 2) Coding Plan 窗口耗尽：冷却到快照中最早的窗口重置点（见
 	// cnProviderQuotaSnapshotReset：429 多由 5h 窗口触发，取较早点避免过度停调）。
 	if account.IsCodingPlan() &&
@@ -295,4 +309,39 @@ func (s *RateLimitService) applyCNProviderReactive429(
 		return true
 	}
 	return false
+}
+
+// zhipu429ResetTime 优先采用上游明确的重试时间；窗口快照只有在确认额度耗尽时才生效。
+func zhipu429ResetTime(account *Account, headers http.Header, body []byte, now time.Time) *time.Time {
+	if resetAt := parseRetryAfterResetTime(headers, now); resetAt != nil && resetAt.After(now) {
+		return resetAt
+	}
+	if resetUnix := parseOpenAIRateLimitResetTime(body); resetUnix != nil {
+		if resetAt := time.Unix(*resetUnix, 0); resetAt.After(now) {
+			return &resetAt
+		}
+	}
+	if !account.IsCodingPlan() {
+		return nil
+	}
+
+	var resetAt *time.Time
+	// https://docs.bigmodel.cn/cn/api/api-code：1302/1305 不代表套餐额度耗尽。
+	switch gjson.GetBytes(body, "error.code").String() {
+	case "1302", "1305":
+		return nil
+	case "1308":
+		resetAt = parseSchedulingResetAt(account.Extra[cnExtraKey(PlatformZhipu, cnExtraSuffix5hReset)])
+	case "1310":
+		resetAt = parseSchedulingResetAt(account.Extra[cnExtraKey(PlatformZhipu, cnExtraSuffixWeeklyReset)])
+	}
+	// 多个窗口均耗尽时须等最后一个重置，不能被较早窗口缩短。
+	if exhausted := pickLatestResetSchedulingCandidate(cnProviderThresholdCandidates(account, PlatformZhipu), 100, now); exhausted != nil &&
+		(resetAt == nil || exhausted.until.After(*resetAt)) {
+		resetAt = exhausted.until
+	}
+	if resetAt != nil && resetAt.After(now) {
+		return resetAt
+	}
+	return nil
 }
