@@ -64,6 +64,24 @@ func TestResponsesWebSocketCompositePlatformGuardKeepsOpenAIAndGrokOnly(t *testi
 	}
 }
 
+func TestCompositeResolvedMappedProviderIsNotOverriddenByModelPrefix(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, platform := range []string{service.PlatformOpenCodeGo, service.PlatformCline} {
+		t.Run(platform, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+			c.Request = c.Request.WithContext(service.WithCompositeRouteDecision(c.Request.Context(), service.CompositeRouteDecision{
+				Matched: true, Source: service.CompositeRouteSourceAccount, TargetPlatform: platform,
+				PublicModel: "deepseek-v4.1-flash", UpstreamModel: "deepseek-v4.1-flash",
+			}))
+			apiKey := &service.APIKey{Group: &service.Group{Platform: service.PlatformComposite}}
+
+			require.True(t, openAICompatibleTextTargetAllowed(c, apiKey, "deepseek-v4.1-flash"))
+			require.Equal(t, platform, effectiveAPIKeyPlatform(c, apiKey))
+		})
+	}
+}
+
 func TestCompositeTargetPlatformAllowedRejectsWrongOrUnknownModel(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

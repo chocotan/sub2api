@@ -47,8 +47,20 @@ Each route belongs to one composite group and contains:
 - `enabled`: disabled routes are ignored by runtime resolution but remain
   visible to admins.
 
-Resolution order is explicit route first, then built-in detection. When more
-than one explicit route matches, exact matches beat prefix matches,
+Resolution order is explicit route first, then account-level exact model
+mappings, then built-in detection. When OpenAI-compatible API-key accounts on
+several platforms map the same public model, the gateway chooses a provider from the enabled
+claimants using current model schedulability, account priority, concurrency load,
+and least-recent use. Disabled accounts are excluded. The multi-platform choice
+is reevaluated for each request rather than cached as a fixed model owner.
+If all claimants are temporarily unavailable, the request stays within the mapped
+providers and reports a capacity error instead of falling back to the model's
+native vendor. Account selection and failover then remain within the chosen
+platform; this does not add cross-platform retries after an upstream error.
+Cross-platform ownership involving OAuth credentials retains the ambiguity
+safeguards; configure an explicit route to select the intended provider.
+
+When more than one explicit route matches, exact matches beat prefix matches,
 endpoint-specific routes beat `any`, longer prefixes beat shorter prefixes,
 then lower `priority`, then lower route id.
 

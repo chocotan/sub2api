@@ -1515,8 +1515,8 @@ func (s *GatewayService) resolveCompositeModelOwnership(ctx context.Context, gro
 		}
 	}
 
-	// 归属取决于配置而非运行时健康：限流/临时不可调度不应让同一模型在
-	// 「唯一归属」与「歧义」之间来回翻转，否则配置错误只会间歇暴露。
+	// 先按配置收集模型声明方；暂时限流不能抹掉映射并触发厂商前缀兜底。
+	// 多个兼容 API Key 平台再按当前可用性选择，OAuth 歧义仍保留。
 	accounts, err := s.accountRepo.ListModelAvailabilityCandidates(ctx, &groupID, domain.ConcretePlatformIDs(), false)
 	if err != nil {
 		return CompositeModelOwnership{}, err
@@ -1524,8 +1524,12 @@ func (s *GatewayService) resolveCompositeModelOwnership(ctx context.Context, gro
 
 	platforms := make(map[string]struct{})
 	ownership := CompositeModelOwnership{}
+	var claimants []Account
+	compatibleAPIKeysOnly := true
 	for _, account := range accounts {
 		if explicitModelMappingClaims(account, model) {
+			claimants = append(claimants, account)
+			compatibleAPIKeysOnly = compatibleAPIKeysOnly && account.Type == AccountTypeAPIKey && account.IsOpenAICompatible()
 			platforms[account.Platform] = struct{}{}
 			ownership.OpenAIGatewayOAuthClaimed = ownership.OpenAIGatewayOAuthClaimed ||
 				(account.IsOAuth() && domain.UsesOpenAIGateway(account.Platform))
@@ -1538,6 +1542,10 @@ func (s *GatewayService) resolveCompositeModelOwnership(ctx context.Context, gro
 		}
 		ownership.Matched = true
 	} else if len(platforms) > 1 {
+		if compatibleAPIKeysOnly {
+			// 多平台选择依赖当前健康和负载，不能缓存为模型的固定归属。
+			return s.selectCompositeAPIKeyPlatform(ctx, claimants, model), nil
+		}
 		ownership.Ambiguous = true
 	}
 

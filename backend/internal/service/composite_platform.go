@@ -204,6 +204,54 @@ func (s *GatewayService) resolveCompositeRouteDecision(ctx context.Context, grou
 	return decision, decision.Matched, nil
 }
 
+// selectCompositeAPIKeyPlatform chooses a mapped provider before protocol dispatch;
+// account selection and slot acquisition still happen in that provider's scheduler.
+func (s *GatewayService) selectCompositeAPIKeyPlatform(ctx context.Context, accounts []Account, model string) CompositeModelOwnership {
+	candidates := make([]accountWithLoad, 0, len(accounts))
+	configured := make([]accountWithLoad, 0, len(accounts))
+	for i := range accounts {
+		account := &accounts[i]
+		if !account.IsActive() || !account.Schedulable {
+			continue
+		}
+		candidate := accountWithLoad{account: account, loadInfo: &AccountLoadInfo{AccountID: account.ID}}
+		configured = append(configured, candidate)
+		if isOpenAICompatibleAccountEligibleForRequest(ctx, account, account.Platform, model, false, "") &&
+			!s.isAccountBlockedBySchedulingThreshold(ctx, account) {
+			candidates = append(candidates, candidate)
+		}
+	}
+	if len(candidates) == 0 {
+		// 保留已声明的平台，让账号调度返回容量错误，避免按厂商前缀改投其他平台。
+		candidates = configured
+	}
+	if len(candidates) == 0 {
+		return CompositeModelOwnership{Ambiguous: true}
+	}
+	if s.concurrencyService != nil {
+		loads := make([]AccountWithConcurrency, 0, len(candidates))
+		for _, candidate := range candidates {
+			loads = append(loads, AccountWithConcurrency{ID: candidate.account.ID, MaxConcurrency: candidate.account.EffectiveLoadFactor()})
+		}
+		if loadMap, err := s.concurrencyService.GetAccountsLoadBatch(ctx, loads); err == nil {
+			var available []accountWithLoad
+			for i := range candidates {
+				if load := loadMap[candidates[i].account.ID]; load != nil {
+					candidates[i].loadInfo = load
+				}
+				if candidates[i].loadInfo.LoadRate < 100 {
+					available = append(available, candidates[i])
+				}
+			}
+			if len(available) > 0 {
+				candidates = available
+			}
+		}
+	}
+	selected := selectByLRU(filterByMinLoadRate(filterByMinPriority(candidates)), false)
+	return CompositeModelOwnership{TargetPlatform: selected.account.Platform, Matched: true}
+}
+
 func isConcreteRequestPlatform(platform string) bool {
 	return domain.IsConcretePlatform(platform)
 }
