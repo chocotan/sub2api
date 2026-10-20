@@ -1544,7 +1544,7 @@ func (s *GatewayService) resolveCompositeModelOwnership(ctx context.Context, gro
 	} else if len(platforms) > 1 {
 		if compatibleAPIKeysOnly {
 			// 多平台选择依赖当前健康和负载，不能缓存为模型的固定归属。
-			return s.selectCompositeAPIKeyPlatform(ctx, claimants, model), nil
+			return s.selectCompositeAPIKeyPlatform(ctx, groupID, claimants, model), nil
 		}
 		ownership.Ambiguous = true
 	}

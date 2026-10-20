@@ -6,6 +6,8 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/domain"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
+	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 // WithResolvedTargetPlatform stores the concrete provider chosen for a request
@@ -204,9 +206,60 @@ func (s *GatewayService) resolveCompositeRouteDecision(ctx context.Context, grou
 	return decision, decision.Matched, nil
 }
 
+type compositeSessionAffinityKey struct{}
+
+type compositeSessionAffinity struct {
+	hash, legacyHash         string
+	grokHash, grokLegacyHash string
+}
+
+// WithCompositeSessionAffinity captures the same session identity used by the
+// account scheduler, before composite routing chooses the provider.
+func WithCompositeSessionAffinity(ctx context.Context, c *gin.Context, body []byte) context.Context {
+	if ctx == nil || c == nil || c.Request == nil {
+		return ctx
+	}
+	hash, legacyHash := openAIRequestSessionHashes(c, body)
+	grokContext := c.Copy()
+	grokContext.Request = c.Request.WithContext(WithResolvedTargetPlatform(ctx, PlatformGrok))
+	grokHash, grokLegacyHash := openAIRequestSessionHashes(grokContext, body)
+	if strings.HasSuffix(strings.TrimSuffix(c.Request.URL.Path, "/"), "/messages") {
+		model := gjson.GetBytes(body, "model").String()
+		hash, _ = ResolveOpenAIMessagesMetadataSession(c, hash, explicitOpenAIRequestSessionID(c, body), model, body)
+		grokHash, _ = ResolveOpenAIMessagesMetadataSession(grokContext, grokHash, explicitOpenAIRequestSessionID(grokContext, body), model, body)
+	}
+	return context.WithValue(ctx, compositeSessionAffinityKey{}, compositeSessionAffinity{
+		hash: hash, legacyHash: legacyHash, grokHash: grokHash, grokLegacyHash: grokLegacyHash,
+	})
+}
+
+func (s *GatewayService) compositeStickyAccountID(ctx context.Context, groupID int64, affinity compositeSessionAffinity, platform string) int64 {
+	if s.cache == nil {
+		return 0
+	}
+	hash, legacyHash := affinity.hash, affinity.legacyHash
+	if platform == PlatformGrok {
+		hash, legacyHash = affinity.grokHash, affinity.grokLegacyHash
+	}
+	if hash == "" {
+		return 0
+	}
+	accountID, err := s.cache.GetSessionAccountID(ctx, groupID, "openai:"+hash)
+	if err == nil && accountID > 0 {
+		return accountID
+	}
+	if legacyHash != "" && (s.cfg == nil || s.cfg.Gateway.OpenAIWS.SessionHashReadOldFallback) {
+		accountID, err = s.cache.GetSessionAccountID(ctx, groupID, "openai:"+legacyHash)
+		if err == nil {
+			return accountID
+		}
+	}
+	return 0
+}
+
 // selectCompositeAPIKeyPlatform chooses a mapped provider before protocol dispatch;
 // account selection and slot acquisition still happen in that provider's scheduler.
-func (s *GatewayService) selectCompositeAPIKeyPlatform(ctx context.Context, accounts []Account, model string) CompositeModelOwnership {
+func (s *GatewayService) selectCompositeAPIKeyPlatform(ctx context.Context, groupID int64, accounts []Account, model string) CompositeModelOwnership {
 	candidates := make([]accountWithLoad, 0, len(accounts))
 	configured := make([]accountWithLoad, 0, len(accounts))
 	for i := range accounts {
@@ -219,6 +272,21 @@ func (s *GatewayService) selectCompositeAPIKeyPlatform(ctx context.Context, acco
 		if isOpenAICompatibleAccountEligibleForRequest(ctx, account, account.Platform, model, false, "") &&
 			!s.isAccountBlockedBySchedulingThreshold(ctx, account) {
 			candidates = append(candidates, candidate)
+		}
+	}
+	if affinity, ok := ctx.Value(compositeSessionAffinityKey{}).(compositeSessionAffinity); ok {
+		// 只认当前模型的健康声明方；并发忙碌仍交由原平台的粘性等待策略处理。
+		stickyIDs := make(map[string]int64)
+		for _, candidate := range candidates {
+			platform := candidate.account.Platform
+			stickyID, seen := stickyIDs[platform]
+			if !seen {
+				stickyID = s.compositeStickyAccountID(ctx, groupID, affinity, platform)
+				stickyIDs[platform] = stickyID
+			}
+			if stickyID == candidate.account.ID {
+				return CompositeModelOwnership{TargetPlatform: platform, Matched: true}
+			}
 		}
 	}
 	if len(candidates) == 0 {

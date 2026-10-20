@@ -162,8 +162,14 @@ func (s *OpenAIGatewayService) GenerateExplicitSessionHash(c *gin.Context, body 
 // sticky seed with the client-requested model so switching models does not
 // inherit a stale account binding (grok2api affinityKey pattern).
 func (s *OpenAIGatewayService) GenerateSessionHash(c *gin.Context, body []byte) string {
+	currentHash, legacyHash := openAIRequestSessionHashes(c, body)
+	attachOpenAILegacySessionHashToGin(c, legacyHash)
+	return currentHash
+}
+
+func openAIRequestSessionHashes(c *gin.Context, body []byte) (string, string) {
 	if c == nil {
-		return ""
+		return "", ""
 	}
 
 	sessionID := explicitOpenAIRequestSessionID(c, body)
@@ -171,16 +177,32 @@ func (s *OpenAIGatewayService) GenerateSessionHash(c *gin.Context, body []byte) 
 		sessionID = deriveOpenAIContentSessionSeed(body)
 	}
 	if sessionID == "" {
-		return ""
+		return "", ""
 	}
 
 	if isGrokRequestContext(c) {
 		sessionID = grokStickyAffinitySeed(sessionID, body)
 	}
 
-	currentHash, legacyHash := deriveOpenAISessionHashes(sessionID)
-	attachOpenAILegacySessionHashToGin(c, legacyHash)
-	return currentHash
+	return deriveOpenAISessionHashes(sessionID)
+}
+
+// ResolveOpenAIMessagesMetadataSession shares the Messages session overrides
+// between provider routing and account scheduling without changing upstream cache keys.
+func ResolveOpenAIMessagesMetadataSession(c *gin.Context, sessionHash, promptCacheKey, reqModel string, body []byte) (string, string) {
+	// Claude Code 的专用会话头优先于内容兜底，但不能提升为上游缓存键。
+	if promptCacheKey == "" {
+		if claudeSessionID := ClaudeCodeSessionIDFromHeader(c); claudeSessionID != "" {
+			return DeriveSessionHashFromSeed(claudeSessionID), promptCacheKey
+		}
+	}
+	if sessionHash != "" {
+		return sessionHash, promptCacheKey
+	}
+	if userID := strings.TrimSpace(gjson.GetBytes(body, "metadata.user_id").String()); userID != "" {
+		sessionHash = DeriveSessionHashFromSeed(reqModel + "-" + userID)
+	}
+	return sessionHash, promptCacheKey
 }
 
 // grokStickyAffinitySeed scopes sticky routing by model without changing the

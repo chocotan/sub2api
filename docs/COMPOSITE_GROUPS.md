@@ -51,8 +51,13 @@ Resolution order is explicit route first, then account-level exact model
 mappings, then built-in detection. When OpenAI-compatible API-key accounts on
 several platforms map the same public model, the gateway chooses a provider from the enabled
 claimants using current model schedulability, account priority, concurrency load,
-and least-recent use. Disabled accounts are excluded. The multi-platform choice
-is reevaluated for each request rather than cached as a fixed model owner.
+and least-recent use. A healthy account already bound to the request's session
+keeps its provider before load balancing, including when its concurrency slots
+are busy; the provider's existing sticky wait policy still applies. Session
+identity and bindings are shared with the account scheduler. Disabled, expired,
+quota-exhausted, or rate-limited accounts do not pin provider selection. The
+multi-platform choice is reevaluated for each request rather than cached as a
+fixed model owner.
 If all claimants are temporarily unavailable, the request stays within the mapped
 providers and reports a capacity error instead of falling back to the model's
 native vendor. Account selection and failover then remain within the chosen
