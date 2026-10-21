@@ -288,9 +288,15 @@ func (s *RateLimitService) applyCNProviderReactive429(
 		s.handleCNProviderInsufficientBalance(ctx, account, extractUpstreamErrorMessage(responseBody))
 		return true
 	}
-	// GLM 的普通 429 是 RPM/并发/繁忙限制，不能仅凭未来的窗口重置点判定套餐耗尽。
-	if account.Platform == PlatformZhipu {
-		resetAt := zhipu429ResetTime(account, headers, responseBody, time.Now())
+	// Kimi/GLM 的普通 429 可能只是繁忙或 RPM 限制，未来的窗口重置点不代表额度耗尽。
+	if account.Platform == PlatformZhipu || account.Platform == PlatformKimi {
+		now := time.Now()
+		var resetAt *time.Time
+		if account.Platform == PlatformKimi {
+			resetAt = kimi429ResetTime(account, headers, responseBody, now)
+		} else {
+			resetAt = zhipu429ResetTime(account, headers, responseBody, now)
+		}
 		if resetAt == nil {
 			return false
 		}
@@ -299,7 +305,7 @@ func (s *RateLimitService) applyCNProviderReactive429(
 			slog.Warn("rate_limit_set_failed", "account_id", account.ID, "error", err)
 			return true
 		}
-		slog.Info("zhipu_account_rate_limited", "account_id", account.ID, "reset_at", *resetAt)
+		slog.Info(account.Platform+"_account_rate_limited", "account_id", account.ID, "reset_at", *resetAt)
 		return true
 	}
 	// 2) Coding Plan 窗口耗尽：冷却到快照中最早的窗口重置点（见
@@ -311,8 +317,8 @@ func (s *RateLimitService) applyCNProviderReactive429(
 	return false
 }
 
-// zhipu429ResetTime 优先采用上游明确的重试时间；窗口快照只有在确认额度耗尽时才生效。
-func zhipu429ResetTime(account *Account, headers http.Header, body []byte, now time.Time) *time.Time {
+// cnProvider429RetryResetTime 读取上游明确的重试时间，不据套餐快照推断限流原因。
+func cnProvider429RetryResetTime(headers http.Header, body []byte, now time.Time) *time.Time {
 	if resetAt := parseRetryAfterResetTime(headers, now); resetAt != nil && resetAt.After(now) {
 		return resetAt
 	}
@@ -320,6 +326,39 @@ func zhipu429ResetTime(account *Account, headers http.Header, body []byte, now t
 		if resetAt := time.Unix(*resetUnix, 0); resetAt.After(now) {
 			return &resetAt
 		}
+	}
+	return nil
+}
+
+func kimi429ResetTime(account *Account, headers http.Header, body []byte, now time.Time) *time.Time {
+	if resetAt := cnProvider429RetryResetTime(headers, body, now); resetAt != nil {
+		return resetAt
+	}
+	if !account.IsCodingPlan() {
+		return nil
+	}
+	message := extractUpstreamErrorMessage(body)
+	if isCNProviderConcurrencyLimit403(account, message) {
+		return nil
+	}
+	switch gjson.GetBytes(body, "error.type").String() {
+	case "engine_overloaded_error", "rate_limit_error", "rate_limit_exceeded":
+		return nil
+	}
+	if exhausted := pickLatestResetSchedulingCandidate(cnProviderThresholdCandidates(account, PlatformKimi), 100, now); exhausted != nil {
+		return exhausted.until
+	}
+	// 明确的套餐耗尽响应沿用现有窗口兜底，兼容探测快照尚未刷新用量的情况。
+	if isCNProviderQuotaExhausted403(account, body, message) {
+		return cnProviderQuotaSnapshotReset(account, now)
+	}
+	return nil
+}
+
+// zhipu429ResetTime 优先采用上游明确的重试时间；窗口快照只有在确认额度耗尽时才生效。
+func zhipu429ResetTime(account *Account, headers http.Header, body []byte, now time.Time) *time.Time {
+	if resetAt := cnProvider429RetryResetTime(headers, body, now); resetAt != nil {
+		return resetAt
 	}
 	if !account.IsCodingPlan() {
 		return nil
